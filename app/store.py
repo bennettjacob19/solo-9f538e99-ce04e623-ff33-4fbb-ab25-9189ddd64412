@@ -43,6 +43,10 @@ class InvalidRequest(ValueError):
     """Raised for requests that are well-formed but semantically invalid."""
 
 
+class InvalidRange(InvalidRequest):
+    """Raised when a mask interval is not a valid range of the prefix."""
+
+
 @dataclass
 class _Block:
     id: int
@@ -92,6 +96,17 @@ class DeleteResult:
     session_id: str
     blocks_freed: int
     blocks_used: int
+
+
+@dataclass
+class ScoreMaskResult:
+    session_id: str
+    prefix_length: int
+    mask_start: int
+    mask_end: int
+    targets: list[int]
+    logprobs_full: np.ndarray
+    logprobs_masked: np.ndarray
 
 
 class BlockStore:
@@ -240,6 +255,59 @@ class BlockStore:
                 blocks_freed=freed,
                 blocks_used=len(self._blocks),
             )
+
+    # --------------------------------------------------------------- scoring
+
+    def score_masked(
+        self, session_id: str, start: int, end: int, targets: list[int]
+    ) -> ScoreMaskResult:
+        """Score ``targets`` as a continuation of the session's prefix, with ``[start, end)`` hidden.
+
+        The interval is 0-based, includes ``start``, excludes ``end``, must
+        contain at least one token, and must keep the last prefix position
+        visible.  Each target's natural log-probability is reported twice:
+        with the full prefix visible and with the interval hidden from
+        attention (RoPE positions are kept either way).
+
+        The prefix is snapshotted under the lock; the read-only math runs
+        after the lock is released, so concurrent appends and deletes against
+        the same session proceed while scoring is in flight and never change
+        the result.  Scoring allocates no blocks and does not modify the
+        session, so it also works when the cache is full.
+        """
+        targets = list(targets)
+        if not targets:
+            raise InvalidRequest("targets must contain at least one token id")
+        if len(targets) > 64:
+            raise InvalidRequest("targets must contain at most 64 token ids")
+        self._validate_tokens(targets)
+        with self._lock:
+            sess = self._get_locked(session_id)
+            length = sess.length
+            if not 0 <= start < end <= length - 1:
+                raise InvalidRange(
+                    f"mask range [{start}, {end}) must contain at least one "
+                    f"token and keep the last prefix position visible: need "
+                    f"0 <= start < end <= {length - 1} for length {length}"
+                )
+            # Snapshot: concatenating copies the rows out of the blocks, so
+            # later appends or deletes cannot change what gets scored.
+            kv = self._session_kv_locked(sess)
+            last_token = sess.tokens[-1]
+
+        t = np.asarray(targets, dtype=np.int64)
+        visible = np.ones(length, dtype=bool)
+        visible[start:end] = False
+        full, masked = self._model.score_contexts(kv, last_token, t, [None, visible])
+        return ScoreMaskResult(
+            session_id=session_id,
+            prefix_length=length,
+            mask_start=start,
+            mask_end=end,
+            targets=targets,
+            logprobs_full=full,
+            logprobs_masked=masked,
+        )
 
     # ---------------------------------------------------------------- private
 

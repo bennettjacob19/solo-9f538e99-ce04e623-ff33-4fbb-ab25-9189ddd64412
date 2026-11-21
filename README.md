@@ -18,6 +18,12 @@ computes K/V only for the newly added tokens.
 - **Forking**: `POST /sessions/{id}/fork` with a `prefix_length` creates a child
   that shares the parent's blocks. Sharing allocates **no new blocks**; the
   global block usage is unchanged.
+- **Masked scoring**: `POST /sessions/{id}/score-mask` reports the natural
+  log-probability of 1–64 target tokens twice — with the full prefix and with
+  one interval of it hidden from attention — so you can tell whether a piece
+  of retrieved context raises or lowers the probability of an expected
+  answer. Scoring is read-only: it allocates no blocks, works when the cache
+  is full, and never recomputes cached K/V rows.
 - **Rejection**: if an append would exceed the global block budget, the *entire*
   append is rejected (HTTP 409). The session's sequence and the block table are
   left exactly as they were.
@@ -54,7 +60,42 @@ Interactive docs are served at **`/docs`** (OpenAPI at `/openapi.json`).
 | `GET`    | `/sessions/{id}`            | Session tokens and block map |
 | `POST`   | `/sessions/{id}/tokens`     | Append token ids; returns logits for the new positions |
 | `POST`   | `/sessions/{id}/fork`       | Branch from `prefix_length`; shares blocks |
+| `POST`   | `/sessions/{id}/score-mask` | Log-probs of target tokens with/without a masked interval |
 | `DELETE` | `/sessions/{id}`            | Delete; frees only exclusive blocks |
+
+### Masked scoring
+
+`POST /sessions/{id}/score-mask` scores how likely target tokens are to
+continue the session's current prefix, with and without a context interval
+hidden from attention:
+
+```json
+{"start": 2, "end": 5, "targets": [9, 10, 11]}
+```
+
+- The session's current tokens are the prefix. `start`/`end` select the
+  masked interval: 0-based, `start` included, `end` excluded. It must contain
+  at least one token and must keep the last prefix position visible
+  (`0 <= start < end <= prefix_length - 1`).
+- `targets` holds 1–64 token ids. The first is predicted from the last prefix
+  position; each later target is also conditioned on the targets before it
+  (teacher forcing), at the absolute positions that follow the prefix.
+- Masking only changes attention visibility — every remaining row keeps its
+  original RoPE position; nothing is re-indexed.
+
+The response gives the fixed prefix length and, per target, the position it
+would occupy plus both natural log-probabilities:
+
+```json
+{"session_id": "...", "prefix_length": 8, "mask_start": 2, "mask_end": 5,
+ "scores": [{"position": 8, "token": 9, "logprob_full": -4.42, "logprob_masked": -4.24}, ...]}
+```
+
+Scoring reads only the session's cached prefix K/V (those rows are never
+recomputed) and is fully read-only: the session is unchanged, no blocks are
+allocated, and a full cache does not prevent scoring. The prefix is fixed
+when the request is accepted — appends and deletes submitted while scoring
+runs proceed normally and do not affect either score set.
 
 ### Typical flow
 
@@ -95,6 +136,7 @@ Errors use a consistent JSON body under `detail`:
 | 409 | `insufficient_blocks` | Append exceeds the global block budget |
 | 422 | `invalid_token` | Token id not an integer in `[0, vocab_size)` |
 | 422 | `invalid_prefix` | `prefix_length` outside `[0, session length]` |
+| 422 | `invalid_range` | Mask interval empty, out of range, or hiding the last prefix position |
 
 ## Running with Docker Compose
 
@@ -136,6 +178,9 @@ The suite covers:
   delete reclamation, logits vs. full forward.
 - `tests/test_cache_reuse.py` — proves only new tokens compute K/V, and that
   block rows carry the correct absolute positions.
+- `tests/test_score_mask.py` — masked-scoring semantics (teacher forcing, RoPE
+  positions kept), read-only/cache-only scoring, snapshot behaviour under
+  concurrent appends/deletes, and the HTTP surface.
 - `tests/test_concurrency.py` — concurrent fork/append/delete are equivalent to
   a serial order; refcount invariants hold; no partial application.
 - `tests/test_api.py` — HTTP status codes, error bodies, and end-to-end logits.

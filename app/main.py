@@ -11,6 +11,7 @@ Endpoint map (see ``/docs`` for the interactive version):
 ``GET  /sessions/{id}``       session details, block map and tokens
 ``POST /sessions/{id}/tokens`` append token ids, returns logits for the new ones
 ``POST /sessions/{id}/fork``  branch from a prefix of an existing session
+``POST /sessions/{id}/score-mask`` score target tokens with a context interval hidden
 ``DELETE /sessions/{id}``     drop a session and reclaim exclusive blocks
 ============================  ====================================================
 """
@@ -27,6 +28,7 @@ from .model import Model, ModelConfig
 from .store import (
     BlockStore,
     InsufficientBlocks,
+    InvalidRange,
     InvalidRequest,
     SessionNotFound,
 )
@@ -66,6 +68,50 @@ class ForkRequest(BaseModel):
         description="Number of leading positions to share with the child session.",
         examples=[2],
     )
+
+
+class ScoreMaskRequest(BaseModel):
+    start: int = Field(
+        ...,
+        description="First masked prefix position (0-based, inclusive).",
+        examples=[1],
+    )
+    end: int = Field(
+        ...,
+        description="End of the masked interval (exclusive). Must be at most "
+        "prefix_length - 1 so the last prefix position stays visible.",
+        examples=[3],
+    )
+    targets: list[int] = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="Target token ids to score, in order (1-64). The first is "
+        "predicted from the last prefix position; each later one is "
+        "conditioned on the targets before it.",
+        examples=[[9, 8, 7]],
+    )
+
+
+class TargetScore(BaseModel):
+    position: int = Field(
+        description="Absolute position the target would occupy (prefix_length + index)."
+    )
+    token: int
+    logprob_full: float = Field(
+        description="Natural log-probability with the full prefix visible."
+    )
+    logprob_masked: float = Field(
+        description="Natural log-probability with the interval hidden from attention."
+    )
+
+
+class ScoreMaskResponse(BaseModel):
+    session_id: str
+    prefix_length: int
+    mask_start: int
+    mask_end: int
+    scores: list[TargetScore]
 
 
 class SessionCreated(BaseModel):
@@ -273,6 +319,39 @@ def create_app(
             "length": result.length,
             "shared_blocks": result.shared_blocks,
             "blocks_allocated": 0,
+        }
+
+    @app.post(
+        "/sessions/{session_id}/score-mask",
+        response_model=ScoreMaskResponse,
+        tags=["sessions"],
+        summary="Score target tokens with a context interval masked out",
+    )
+    def score_mask(body: ScoreMaskRequest, session_id: str = Path(...)) -> dict:
+        try:
+            result = store.score_masked(
+                session_id, body.start, body.end, body.targets
+            )
+        except SessionNotFound:
+            raise _error(404, "session_not_found", f"unknown session {session_id}") from None
+        except InvalidRange as exc:
+            raise _error(422, "invalid_range", str(exc)) from None
+        except InvalidRequest as exc:
+            raise _error(422, "invalid_token", str(exc)) from None
+        return {
+            "session_id": result.session_id,
+            "prefix_length": result.prefix_length,
+            "mask_start": result.mask_start,
+            "mask_end": result.mask_end,
+            "scores": [
+                {
+                    "position": result.prefix_length + i,
+                    "token": token,
+                    "logprob_full": float(result.logprobs_full[i]),
+                    "logprob_masked": float(result.logprobs_masked[i]),
+                }
+                for i, token in enumerate(result.targets)
+            ],
         }
 
     @app.delete(
